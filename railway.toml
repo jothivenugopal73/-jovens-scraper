@@ -3,6 +3,5 @@ builder = "NIXPACKS"
 
 [deploy]
 cronSchedule = "30 0 * * 1-6"
-# Runs Monday–Saturday at 12:30 AM UTC = 6:00 AM IST
-# Results are in your Google Sheet every morning when you wake up
 startCommand = "python scraper.py"
+restartPolicyType = "never"
