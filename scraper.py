@@ -6,56 +6,65 @@ import gspread
 from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 
-
 # ─────────────────────────────────────────────
-# CONFIG — all values come from Railway env vars
+# CONFIG
 # ─────────────────────────────────────────────
 APIFY_API_KEY      = os.environ["APIFY_API_KEY"]
 GOOGLE_SHEET_ID    = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS = os.environ["GOOGLE_CREDENTIALS"]
 SHEET_TAB_NAME     = "Social_Leads"
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 
 HOURS_FRESH        = 48
-MAX_POSTS          = 25
+MAX_POSTS          = 30
+MIN_GEMINI_SCORE   = 70   # only write leads scoring 70+
+
+BASE_URL  = "https://api.apify.com/v2"
+ACTOR_ID  = "trudax~reddit-scraper-lite"
 
 # ─────────────────────────────────────────────
-# WHAT WE SEARCH
+# SUBREDDITS ONLY — no keyword searches
 # ─────────────────────────────────────────────
-YOGA_SEARCHES = [
-    "online yoga classes",
-    "yoga teacher online",
-    "yoga lessons online",
-    "beginner yoga online",
-    "live yoga class online",
-]
-
-PIANO_SEARCHES = [
-    "learn piano online",
-    "piano lessons online",
-    "online piano teacher",
-    "piano classes for kids online",
-    "online music lessons kids",
-]
-
 YOGA_SUBREDDITS = [
-    "yoga", "fitness", "xxfitness", "onlinefitness", "mommit", "beyondthebump",
+    "yoga",
+    "xxfitness",
+    "onlinefitness",
+    "mommit",
+    "beyondthebump",
+    "fitness",
 ]
 
 PIANO_SUBREDDITS = [
-    "pianolessons", "piano", "learnpiano", "Parenting", "homeschool", "kidsactivities",
+    "pianolessons",
+    "piano",
+    "learnpiano",
+    "Parenting",
+    "homeschool",
+    "kidsactivities",
 ]
 
-BASE_URL = "https://api.apify.com/v2"
-ACTOR_ID = "trudax~reddit-scraper-lite"
+YOGA_INTENT_KEYWORDS = [
+    "yoga class", "yoga teacher", "yoga instructor", "yoga lessons",
+    "yoga online", "online yoga", "yoga recommendation", "yoga app",
+    "learn yoga", "yoga beginner", "yoga practice", "yoga schedule",
+    "yoga accountability", "yoga studio", "yoga routine",
+]
+
+PIANO_INTENT_KEYWORDS = [
+    "piano lesson", "piano teacher", "piano class", "piano online",
+    "online piano", "piano recommendation", "learn piano", "piano app",
+    "piano instructor", "piano for kids", "music lesson", "music teacher",
+    "piano practice", "piano beginner", "music school",
+]
 
 # ─────────────────────────────────────────────
 # GOOGLE SHEET
 # ─────────────────────────────────────────────
 SHEET_HEADERS = [
     "#", "Date Found", "Time (IST)", "Post Age", "Platform",
-    "Subreddit / Source", "Author / Handle", "Post Title",
-    "Post Content Snippet", "Post Link", "Business", "Keyword Matched",
-    "Status", "Outreach Method", "Outreach Date", "Response", "Outcome / Notes",
+    "Subreddit", "Author", "Post Title", "Post Snippet",
+    "Post Link", "Business", "Gemini Score", "Status",
+    "Outreach Method", "Outreach Date", "Response", "Outcome / Notes",
 ]
 
 def get_sheet():
@@ -71,10 +80,10 @@ def get_sheet():
         worksheet = spreadsheet.worksheet(SHEET_TAB_NAME)
     except gspread.exceptions.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
-            title=SHEET_TAB_NAME, rows=2000, cols=len(SHEET_HEADERS)
+            title=SHEET_TAB_NAME, rows=5000, cols=len(SHEET_HEADERS)
         )
         worksheet.append_row(SHEET_HEADERS)
-        worksheet.format(f"A1:Q1", {
+        worksheet.format("A1:Q1", {
             "textFormat": {"bold": True},
             "backgroundColor": {"red": 0.17, "green": 0.24, "blue": 0.48},
             "horizontalAlignment": "CENTER",
@@ -86,84 +95,134 @@ def get_sheet():
 def get_existing_links(worksheet):
     try:
         col_index = SHEET_HEADERS.index("Post Link") + 1
-        links = worksheet.col_values(col_index)
-        return set(links[1:])
-    except Exception:
+        all_values = worksheet.col_values(col_index)
+        return set(v.strip() for v in all_values[1:] if v.strip())
+    except Exception as e:
+        print(f"  ⚠ Could not fetch existing links: {e}")
         return set()
 
 
 def get_next_number(worksheet):
     try:
         col_values = worksheet.col_values(1)
-        numbers = [int(v) for v in col_values[1:] if str(v).isdigit()]
+        numbers = []
+        for v in col_values[1:]:
+            try:
+                numbers.append(int(float(str(v))))
+            except Exception:
+                pass
         return max(numbers) + 1 if numbers else 1
     except Exception:
         return 1
 
 
-def write_to_sheet(worksheet, posts, existing_links, start_number):
+def write_leads(worksheet, leads, existing_links, start_number):
     ist_offset = timedelta(hours=5, minutes=30)
     now_ist = datetime.now(timezone.utc) + ist_offset
-    rows_to_add = []
+    rows = []
     counter = start_number
-    for post in posts:
-        if post["url"] in existing_links:
+
+    for lead in leads:
+        url = lead["url"].strip()
+        if url in existing_links:
             continue
-        business = "🧘 Yoga" if post["type"] == "yoga" else "🎹 Piano"
+        business = "🧘 Yoga" if lead["type"] == "yoga" else "🎹 Piano"
         row = [
             counter,
             now_ist.strftime("%d-%b-%Y"),
             now_ist.strftime("%I:%M %p"),
-            post["age"],
+            lead["age"],
             "Reddit",
-            post["subreddit"],
-            post["author"],
-            post["title"][:150],
-            post["text"][:300],
-            post["url"],
+            lead["subreddit"],
+            lead["author"],
+            lead["title"][:150],
+            lead["snippet"][:300],
+            url,
             business,
-            post["keyword"],
+            lead["score"],
             "New",
             "", "", "", "",
         ]
-        rows_to_add.append(row)
-        existing_links.add(post["url"])
+        rows.append(row)
+        existing_links.add(url)
         counter += 1
-    if rows_to_add:
-        worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
-        print(f"  ✓ {len(rows_to_add)} new lead(s) written to sheet")
+
+    if rows:
+        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+        print(f"  ✓ {len(rows)} new lead(s) written to sheet")
     else:
-        print("  ℹ No new leads to write")
-    return len(rows_to_add)
+        print("  ℹ No new qualified leads to write")
+    return len(rows)
+
+
+# ─────────────────────────────────────────────
+# GEMINI SCORING
+# ─────────────────────────────────────────────
+def score_with_gemini(title, snippet, post_type):
+    """Score a post 0-100 for yoga or piano class buying intent."""
+    if not GEMINI_API_KEY:
+        # No Gemini key — use simple keyword scoring instead
+        return keyword_score(title, snippet, post_type)
+
+    prompt = f"""You are a lead qualification expert for an online {post_type} class school.
+Score this Reddit post from 0-100 based on how likely the person is looking for an online {post_type} class.
+
+100 = Explicitly asking for a {post_type} class/teacher online
+80  = Strongly interested, asking for recommendations
+60  = Curious about {post_type} online, exploring options
+40  = Mentions {post_type} but not looking for a class
+20  = Barely related
+0   = Completely unrelated
+
+Post Title: {title}
+Post Content: {snippet[:500]}
+
+Reply with ONLY a number between 0 and 100. Nothing else."""
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            score = int(''.join(filter(str.isdigit, text))[:3])
+            return min(100, max(0, score))
+    except Exception:
+        pass
+    return keyword_score(title, snippet, post_type)
+
+
+def keyword_score(title, snippet, post_type):
+    """Fallback keyword-based scoring when Gemini is not available."""
+    keywords = YOGA_INTENT_KEYWORDS if post_type == "yoga" else PIANO_INTENT_KEYWORDS
+    combined = (title + " " + snippet).lower()
+    matched = sum(1 for kw in keywords if kw.lower() in combined)
+    if matched >= 3:
+        return 85
+    elif matched == 2:
+        return 72
+    elif matched == 1:
+        return 55
+    return 20
 
 
 # ─────────────────────────────────────────────
 # APIFY
 # ─────────────────────────────────────────────
-def run_reddit_actor(search_term=None, subreddit=None):
+def run_actor(subreddit):
     url = f"{BASE_URL}/acts/{ACTOR_ID}/runs"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {APIFY_API_KEY}",
     }
-    if search_term:
-        payload = {
-            "searches": [search_term],
-            "maxItems": MAX_POSTS,
-            "sort": "new",
-            "time": "day",
-            "type": "posts",
-        }
-    else:
-        payload = {
-            "startUrls": [{"url": f"https://www.reddit.com/r/{subreddit}/new/"}],
-            "maxItems": MAX_POSTS,
-            "type": "posts",
-        }
+    payload = {
+        "startUrls": [{"url": f"https://www.reddit.com/r/{subreddit}/new/"}],
+        "maxItems": MAX_POSTS,
+        "type": "posts",
+    }
     resp = requests.post(url, json=payload, headers=headers, timeout=30)
     if resp.status_code not in (200, 201):
-        label = search_term or subreddit
-        print(f"  ✗ Failed for '{label}': {resp.status_code}")
+        print(f"  ✗ Failed to start for r/{subreddit}: {resp.status_code}")
         return None
     return resp.json()["data"]["id"]
 
@@ -178,10 +237,8 @@ def wait_for_run(run_id, timeout=180):
         if status == "SUCCEEDED":
             return True
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            print(f"  ✗ Run ended: {status}")
             return False
         time.sleep(5)
-    print(f"  ✗ Timed out")
     return False
 
 
@@ -211,91 +268,78 @@ def get_age_label(date_str):
             post_time = datetime.fromtimestamp(date_str, tz=timezone.utc)
         else:
             post_time = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
-        age_hours = int((datetime.now(timezone.utc) - post_time).total_seconds() / 3600)
-        return f"{age_hours}h ago" if age_hours < 48 else f"{age_hours//24}d ago"
+        hours = int((datetime.now(timezone.utc) - post_time).total_seconds() / 3600)
+        return f"{hours}h ago" if hours < 48 else f"{hours//24}d ago"
     except Exception:
         return "Unknown"
 
 
-def format_post(post, keyword, post_type):
-    title  = (post.get("title") or "").strip()
-    text   = (post.get("body") or post.get("selftext") or post.get("text") or "").strip()[:300]
-    url    = post.get("url") or post.get("postUrl") or ""
-    author = post.get("author") or post.get("username") or "unknown"
-    sub    = post.get("subreddit") or post.get("communityName") or "unknown"
-    date_str = post.get("createdAt") or post.get("created_utc") or ""
-    if url and not url.startswith("http"):
-        url = f"https://reddit.com{url}"
-    return {
-        "type":      post_type,
-        "keyword":   keyword,
-        "title":     title,
-        "text":      text,
-        "url":       url,
-        "author":    f"u/{author}",
-        "subreddit": f"r/{sub}",
-        "age":       get_age_label(date_str),
-        "date_str":  date_str,
-    }
+def is_bot(author):
+    bots = ["automoderator", "bot", "automod"]
+    return any(b in str(author).lower() for b in bots)
 
 
-def is_relevant(post, keywords):
-    combined = (
-        (post.get("title") or "") + " " +
-        (post.get("body") or post.get("selftext") or post.get("text") or "")
-    ).lower()
-    return any(kw.lower() in combined for kw in keywords)
+def scan_subreddit(subreddit, post_type, intent_keywords, seen_urls, existing_links):
+    """Scan a subreddit, filter for intent, score with Gemini, return qualified leads."""
+    print(f"  📡 r/{subreddit}...")
+    run_id = run_actor(subreddit)
+    if not run_id or not wait_for_run(run_id):
+        print(f"     ✗ Failed")
+        return []
 
+    results = get_results(run_id)
+    leads = []
 
-def scrape_and_collect(label, searches, subreddits, post_type,
-                       relevance_keywords, seen_urls, existing_links):
-    posts = []
-
-    print(f"\n  {label} — Keyword searches ({len(searches)})")
-    print(f"  {'─'*50}")
-    for keyword in searches:
-        print(f"  🔍 \"{keyword}\"...")
-        run_id = run_reddit_actor(search_term=keyword)
-        if not run_id or not wait_for_run(run_id):
+    for post in results:
+        # Skip bots
+        author = post.get("author") or post.get("username") or ""
+        if is_bot(author):
             continue
-        count = 0
-        for post in get_results(run_id):
-            date_str = post.get("createdAt") or post.get("created_utc") or ""
-            if not is_fresh(date_str):
-                continue
-            url = post.get("url") or ""
-            if url in seen_urls or url in existing_links:
-                continue
-            seen_urls.add(url)
-            posts.append(format_post(post, keyword, post_type))
-            count += 1
-        print(f"     ✓ {count} fresh post(s)")
-        time.sleep(2)
 
-    print(f"\n  {label} — Subreddit scans ({len(subreddits)})")
-    print(f"  {'─'*50}")
-    for sub in subreddits:
-        print(f"  📡 r/{sub}...")
-        run_id = run_reddit_actor(subreddit=sub)
-        if not run_id or not wait_for_run(run_id):
+        # Skip stale posts
+        date_str = post.get("createdAt") or post.get("created_utc") or ""
+        if not is_fresh(date_str):
             continue
-        count = 0
-        for post in get_results(run_id):
-            if not is_relevant(post, relevance_keywords):
-                continue
-            date_str = post.get("createdAt") or post.get("created_utc") or ""
-            if not is_fresh(date_str):
-                continue
-            url = post.get("url") or ""
-            if url in seen_urls or url in existing_links:
-                continue
-            seen_urls.add(url)
-            posts.append(format_post(post, f"r/{sub} scan", post_type))
-            count += 1
-        print(f"     ✓ {count} relevant fresh post(s)")
-        time.sleep(2)
 
-    return posts
+        # Skip duplicates
+        url = (post.get("url") or post.get("postUrl") or "").strip()
+        if not url or url in seen_urls or url in existing_links:
+            continue
+
+        # Must be an original post not a comment
+        title = (post.get("title") or "").strip()
+        if not title:
+            continue
+
+        snippet = (post.get("body") or post.get("selftext") or post.get("text") or "").strip()
+        combined = (title + " " + snippet).lower()
+
+        # Quick pre-filter — must contain at least one intent keyword
+        if not any(kw.lower() in combined for kw in intent_keywords):
+            continue
+
+        # Score with Gemini
+        score = score_with_gemini(title, snippet, post_type)
+        if score < MIN_GEMINI_SCORE:
+            print(f"     ⚡ Scored {score} — skipped: {title[:60]}")
+            continue
+
+        seen_urls.add(url)
+        leads.append({
+            "type":      post_type,
+            "subreddit": f"r/{subreddit}",
+            "author":    f"u/{author}",
+            "title":     title,
+            "snippet":   snippet[:300],
+            "url":       url,
+            "age":       get_age_label(date_str),
+            "score":     score,
+        })
+        print(f"     ✅ Score {score}: {title[:60]}")
+
+    print(f"     → {len(leads)} qualified lead(s)")
+    time.sleep(2)
+    return leads
 
 
 # ─────────────────────────────────────────────
@@ -305,50 +349,48 @@ def main():
     ist_offset = timedelta(hours=5, minutes=30)
     now_ist = datetime.now(timezone.utc) + ist_offset
     print(f"\n{'═'*60}")
-    print(f"  JOVENS REDDIT SCRAPER")
+    print(f"  JOVENS REDDIT SCRAPER v3")
     print(f"  {now_ist.strftime('%d %b %Y  %I:%M %p IST')}")
-    print(f"  Fresh window: last {HOURS_FRESH} hours")
-    print(f"{'═'*60}")
+    print(f"  Mode: Subreddit scan only + Gemini scoring")
+    print(f"  Min score to qualify: {MIN_GEMINI_SCORE}/100")
+    print(f"{'═'*60}\n")
 
-    print("\n  📊 Connecting to Google Sheet...")
+    print("  📊 Connecting to Google Sheet...")
     worksheet      = get_sheet()
     existing_links = get_existing_links(worksheet)
     start_number   = get_next_number(worksheet)
-    print(f"  ✓ Connected — {len(existing_links)} existing leads in sheet")
+    print(f"  ✓ Connected — {len(existing_links)} existing leads in sheet\n")
 
-    seen_urls = set()
+    seen_urls  = set()
+    all_leads  = []
 
-    yoga_posts = scrape_and_collect(
-        label="🧘 YOGA",
-        searches=YOGA_SEARCHES,
-        subreddits=YOGA_SUBREDDITS,
-        post_type="yoga",
-        relevance_keywords=["yoga", "online class", "teacher", "instructor", "lessons", "live class"],
-        seen_urls=seen_urls,
-        existing_links=existing_links,
-    )
+    # YOGA subreddits
+    print(f"  🧘 YOGA SUBREDDITS ({len(YOGA_SUBREDDITS)})")
+    print(f"  {'─'*50}")
+    for sub in YOGA_SUBREDDITS:
+        leads = scan_subreddit(sub, "yoga", YOGA_INTENT_KEYWORDS, seen_urls, existing_links)
+        all_leads.extend(leads)
 
-    piano_posts = scrape_and_collect(
-        label="🎹 PIANO",
-        searches=PIANO_SEARCHES,
-        subreddits=PIANO_SUBREDDITS,
-        post_type="piano",
-        relevance_keywords=["piano", "music", "online", "teacher", "lessons", "kids", "learn"],
-        seen_urls=seen_urls,
-        existing_links=existing_links,
-    )
+    # PIANO subreddits
+    print(f"\n  🎹 PIANO SUBREDDITS ({len(PIANO_SUBREDDITS)})")
+    print(f"  {'─'*50}")
+    for sub in PIANO_SUBREDDITS:
+        leads = scan_subreddit(sub, "piano", PIANO_INTENT_KEYWORDS, seen_urls, existing_links)
+        all_leads.extend(leads)
 
-    all_posts = yoga_posts + piano_posts
+    # Write to sheet
+    print(f"\n  📝 Writing {len(all_leads)} qualified lead(s) to sheet...")
+    new_count = write_leads(worksheet, all_leads, existing_links, start_number)
 
-    print(f"\n  📝 Writing {len(all_posts)} lead(s) to Google Sheet...")
-    new_count = write_to_sheet(worksheet, all_posts, existing_links, start_number)
+    yoga_count  = sum(1 for l in all_leads if l["type"] == "yoga")
+    piano_count = sum(1 for l in all_leads if l["type"] == "piano")
 
     print(f"\n{'═'*60}")
     print(f"  DONE")
-    print(f"  🧘 Yoga leads  : {len(yoga_posts)}")
-    print(f"  🎹 Piano leads : {len(piano_posts)}")
-    print(f"  📊 New rows added : {new_count}")
-    print(f"  Open sheet → filter Status = New → go reply")
+    print(f"  🧘 Yoga leads  : {yoga_count}")
+    print(f"  🎹 Piano leads : {piano_count}")
+    print(f"  📊 New rows    : {new_count}")
+    print(f"  Open sheet → filter Status = New → reply to leads")
     print(f"{'═'*60}\n")
 
 
