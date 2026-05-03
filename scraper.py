@@ -14,7 +14,7 @@ GOOGLE_CREDENTIALS    = os.environ["GOOGLE_CREDENTIALS"]  # JSON string
 MEDSOLUTIONS_SHEET_ID = os.environ["MEDSOLUTIONS_SHEET_ID"]
 
 SHEET_TAB = "MedSolutions_Leads"
-ACTOR_ID  = "harvestapi/linkedin-profile-search"
+ACTOR_ID  = "harvestapi~linkedin-profile-search"
 APIFY_URL = "https://api.apify.com/v2"
 
 # Search targets — specialty label : LinkedIn search query
@@ -91,10 +91,14 @@ def run_apify_search(query: str) -> list[dict]:
         f"{APIFY_URL}/acts/{ACTOR_ID}/runs",
         params={"token": APIFY_API_KEY},
         json={
-            "query":           query,
-            "mode":            "short",
-            "count":           MAX_PROFILES_PER_QUERY,
-            "locationsFilter": [LOCATION_FILTER],
+            "searchQuery":           query,
+            "profileScraperMode":    "Short",
+            "maxItems":              MAX_PROFILES_PER_QUERY,
+            "locations":             [LOCATION_FILTER],
+            "autoQuerySegmentation": False,
+            "recentlyChangedJobs":   False,
+            "recentlyPostedOnLinkedIn": False,
+            "startPage":             1,
         },
         timeout=30,
     )
