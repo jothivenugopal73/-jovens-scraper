@@ -2,6 +2,5 @@
 builder = "NIXPACKS"
 
 [deploy]
-cronSchedule = "30 0 * * 1-6"
 startCommand = "python scraper.py"
 restartPolicyType = "never"
