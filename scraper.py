@@ -23,7 +23,7 @@ SEARCH_TARGETS = {
     "Primary Care":     "Family Medicine Primary Care Physician Owner Dallas Texas",
 }
 
-MAX_PROFILES_PER_QUERY = 25
+MAX_PROFILES_PER_QUERY = 3
 LOCATION_FILTER        = "Dallas, Texas"
 
 VALID_TITLE_KEYWORDS = [
@@ -113,7 +113,7 @@ def run_apify_search(query: str) -> list:
 # ── GEMINI SCORER ─────────────────────────────────────────────────────────────
 def score_with_gemini(first, last, title, company, summary, specialty) -> dict:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini = genai.GenerativeModel("gemini-1.5-flash")
+    gemini = genai.GenerativeModel("gemini-2.5-flash", generation_config={"response_mime_type": "application/json"})
     prompt = f"""
 You are a medical billing sales analyst for Jovens MedSolutions,
 a DFW-based billing company targeting small independent practices with 1-3 doctors.
@@ -252,7 +252,7 @@ def main():
 
             new_rows.append(row)
             existing_urls.add(linkedin)
-            time.sleep(1)
+            time.sleep(6)
 
         if new_rows:
             append_rows(sheet, new_rows)
