@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 import requests
 from datetime import datetime
 import google.generativeai as genai
@@ -18,13 +19,16 @@ ACTOR_ID  = "harvestapi~linkedin-profile-search"
 APIFY_URL = "https://api.apify.com/v2"
 
 SEARCH_TARGETS = {
-    "Chiropractic":     "Chiropractor Owner Dallas Texas",
+    "Chiropractic":      "Chiropractor Owner Dallas Texas",
     "Behavioral Health": "Therapist LCSW Psychiatrist Owner Dallas Texas",
-    "Primary Care":     "Family Medicine Primary Care Physician Owner Dallas Texas",
+    "Primary Care":      "Family Medicine Primary Care Physician Owner Dallas Texas",
 }
 
 MAX_PROFILES_PER_QUERY = 3
 LOCATION_FILTER        = "Dallas, Texas"
+
+# Minimum Gemini score to bother fetching website (saves time on weak leads)
+WEBSITE_LOOKUP_MIN_SCORE = 50
 
 VALID_TITLE_KEYWORDS = [
     "owner", "founder", "chiropractor", "therapist", "psychiatrist",
@@ -37,6 +41,14 @@ BAD_TITLE_KEYWORDS = [
     "professor", "student", "intern", "resident", "sales",
     "marketing", "recruiter", "consultant", "engineer", "investor",
     "chairman", "board",
+]
+
+# Domains to skip — not practice websites
+SKIP_DOMAINS = [
+    "linkedin.com", "facebook.com", "instagram.com", "twitter.com",
+    "yelp.com", "healthgrades.com", "zocdoc.com", "psychology today",
+    "webmd.com", "wikipedia.org", "indeed.com", "glassdoor.com",
+    "google.com", "youtube.com", "npidb.org", "sharecare.com",
 ]
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
@@ -61,6 +73,64 @@ def append_rows(sheet, rows: list):
         return
     sheet.append_rows(rows, value_input_option="USER_ENTERED")
     print(f"  Appended {len(rows)} new rows to sheet")
+
+# ── WEBSITE LOOKUP ────────────────────────────────────────────────────────────
+def get_practice_website(company_name: str, location: str) -> str:
+    """
+    Google search the practice name + location and return the first
+    result URL that looks like a real practice website.
+    Returns empty string if nothing useful found.
+    """
+    if not company_name:
+        return ""
+
+    # Build a clean search query
+    city = location.split(",")[0].strip() if "," in location else "Dallas"
+    query = f"{company_name} {city} Texas official website"
+
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": 5},
+            headers=headers,
+            timeout=10,
+        )
+
+        if resp.status_code != 200:
+            print(f"    Website lookup: Google returned {resp.status_code}")
+            return ""
+
+        # Extract URLs from Google result HTML
+        # Google wraps result links in /url?q=... format
+        urls = re.findall(r'/url\?q=(https?://[^&"]+)', resp.text)
+
+        for raw_url in urls:
+            url = requests.utils.unquote(raw_url).split("&")[0].strip()
+
+            # Skip known directory / social / review sites
+            if any(skip in url.lower() for skip in SKIP_DOMAINS):
+                continue
+
+            # Must look like a real domain (has at least one dot after scheme)
+            if not re.match(r'https?://[^/]+\.[^/]+', url):
+                continue
+
+            print(f"    Website found: {url}")
+            return url
+
+        print(f"    Website lookup: no clean result for '{company_name}'")
+        return ""
+
+    except Exception as e:
+        print(f"    Website lookup error: {e}")
+        return ""
 
 # ── APIFY ─────────────────────────────────────────────────────────────────────
 def run_apify_search(query: str) -> list:
@@ -113,7 +183,10 @@ def run_apify_search(query: str) -> list:
 # ── GEMINI SCORER ─────────────────────────────────────────────────────────────
 def score_with_gemini(first, last, title, company, summary, specialty) -> dict:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini = genai.GenerativeModel("gemini-2.5-flash", generation_config={"response_mime_type": "application/json"})
+    gemini = genai.GenerativeModel(
+        "gemini-2.5-flash",
+        generation_config={"response_mime_type": "application/json"},
+    )
     prompt = f"""
 You are a medical billing sales analyst for Jovens MedSolutions,
 a DFW-based billing company targeting small independent practices with 1-3 doctors.
@@ -172,7 +245,11 @@ def parse_profile(profile: dict, specialty: str) -> dict:
     company_url = (first_pos.get("companyLinkedinUrl") or "").strip()
     linkedin    = (profile.get("linkedinUrl") or "").strip()
     location    = profile.get("location") or {}
-    loc_text    = location.get("linkedinText", "") if isinstance(location, dict) else str(location)
+    loc_text    = (
+        location.get("linkedinText", "")
+        if isinstance(location, dict)
+        else str(location)
+    )
     summary     = (profile.get("summary") or "").strip()
     return {
         "first": first, "last": last,
@@ -240,14 +317,35 @@ def main():
             )
             print(f"    Score: {scored['score']} | {scored['temperature']} | {scored['reason'][:70]}...")
 
+            # ── WEBSITE LOOKUP ────────────────────────────────────────────
+            # Only look up website for leads worth pursuing
+            website = ""
+            if scored["score"] >= WEBSITE_LOOKUP_MIN_SCORE and parsed["company"]:
+                print(f"    Looking up website for: {parsed['company']}")
+                website = get_practice_website(parsed["company"], parsed["location"])
+                time.sleep(2)  # polite delay between Google requests
+            else:
+                print(f"    Skipping website lookup (score {scored['score']} < {WEBSITE_LOOKUP_MIN_SCORE})")
+            # ─────────────────────────────────────────────────────────────
+
             row = [
-                datetime.now().strftime("%d/%m/%Y"),
-                parsed["first"], parsed["last"], parsed["full_name"],
-                parsed["company"], specialty, parsed["title"], parsed["location"],
-                parsed["linkedin"], parsed["company_url"],
-                parsed["summary"][:300],
-                scored["score"], scored["temperature"], scored["reason"],
-                "New", "", "", "", "",
+                datetime.now().strftime("%d/%m/%Y"),   # col 1  Date Found
+                parsed["first"],                        # col 2  First Name
+                parsed["last"],                         # col 3  Last Name
+                parsed["full_name"],                    # col 4  Full Name
+                parsed["company"],                      # col 5  Company
+                specialty,                              # col 6  Specialty
+                parsed["title"],                        # col 7  Title
+                parsed["location"],                     # col 8  Location
+                parsed["linkedin"],                     # col 9  LinkedIn URL
+                parsed["company_url"],                  # col 10 Company LinkedIn
+                website,                                # col 11 Website  ← NEW
+                parsed["summary"][:300],                # col 12 Summary
+                scored["score"],                        # col 13 Gemini Score
+                scored["temperature"],                  # col 14 Temperature
+                scored["reason"],                       # col 15 Reason
+                "New",                                  # col 16 Outreach Status
+                "", "", "", "",                         # col 17-20 spare
             ]
 
             new_rows.append(row)
