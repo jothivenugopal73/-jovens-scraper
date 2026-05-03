@@ -26,15 +26,11 @@ ACTOR_ID  = "powerai~facebook-post-search-scraper"
 # HIGH INTENT SEARCH KEYWORDS
 # ─────────────────────────────────────────────
 YOGA_SEARCHES = [
-    "looking for yoga classes online",
-    "online yoga class recommendation",
-    "beginner yoga help",
-    "yoga zoom class USA",
-    "yoga for weight loss program",
-    "need yoga instructor online",
-    "live yoga class online",
-    "yoga classes near me online",
+    "looking for yoga classes online USA",
+    "need yoga instructor online United States",
+    "beginner yoga help online US",
 ]
+MAX_RESULTS = 20
 
 # ─────────────────────────────────────────────
 # IGNORE FILTERS — skip these types of posts
